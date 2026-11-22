@@ -58,6 +58,9 @@ public class BoundedPriorityTaskQueue {
      */
     private final Condition notEmpty = lock.newCondition();
 
+    /** 队列是否已关闭（停机标记）；关闭后不再接收新任务，消费者在队列取空后退出 */
+    private volatile boolean closed;
+
     public BoundedPriorityTaskQueue(@Value("${async-queue.queue.capacity:4096}") int capacity) {
         if (capacity <= 0) {
             throw new IllegalArgumentException("队列容量必须大于 0, 当前值: " + capacity);
@@ -76,11 +79,15 @@ public class BoundedPriorityTaskQueue {
      * @param task 任务，不能为 null
      * @return 入队成功返回 true
      * @throws TaskQueueFullException 队列已满
+     * @throws IllegalStateException  队列已关闭（服务正在停机）
      */
     public boolean offer(TaskEntity task) {
         Objects.requireNonNull(task, "任务不能为 null");
         lock.lock();
         try {
+            if (closed) {
+                throw new IllegalStateException("队列已关闭，不再接收新任务");
+            }
             if (tasks.size() >= capacity) {
                 throw new TaskQueueFullException(capacity, tasks.size());
             }
@@ -101,7 +108,7 @@ public class BoundedPriorityTaskQueue {
     /**
      * 阻塞取出优先级最高的任务。
      *
-     * @return 任务实体
+     * @return 任务实体；队列已关闭且为空时返回 null，消费者据此退出
      * @throws InterruptedException 等待期间线程被中断（如优雅停机）
      */
     public TaskEntity take() throws InterruptedException {
@@ -109,12 +116,38 @@ public class BoundedPriorityTaskQueue {
         lock.lockInterruptibly();
         try {
             while (tasks.isEmpty()) {
+                if (closed) {
+                    // 关闭后不再等待，交给消费者线程退出
+                    return null;
+                }
                 notEmpty.await();
             }
             return tasks.remove(0);
         } finally {
             lock.unlock();
         }
+    }
+
+    /**
+     * 关闭队列：停止接收新任务，并唤醒所有阻塞在 take() 的消费者让它们退出。
+     *
+     * <p>已在队列中的任务不会被丢弃，仍可被 take() 取走，由停机流程先 drainAll() 回写。</p>
+     */
+    public void close() {
+        lock.lock();
+        try {
+            closed = true;
+            notEmpty.signalAll();
+        } finally {
+            lock.unlock();
+        }
+    }
+
+    /**
+     * 队列是否已关闭。
+     */
+    public boolean isClosed() {
+        return closed;
     }
 
     /**

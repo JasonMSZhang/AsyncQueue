@@ -11,6 +11,9 @@ import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
 
 import java.time.LocalDateTime;
+import java.util.ArrayList;
+import java.util.Collection;
+import java.util.List;
 import java.util.UUID;
 
 /**
@@ -24,6 +27,9 @@ public class TaskStateService {
 
     /** fail_reason 字段长度上限，超长截断，完整堆栈只进日志 */
     private static final int FAIL_REASON_MAX_LENGTH = 512;
+
+    /** 批量 UPDATE 的单批大小，避免 IN 列表过长 */
+    private static final int BATCH_UPDATE_SIZE = 500;
 
     private final TaskRepository taskRepository;
     private final TaskResultRepository taskResultRepository;
@@ -121,20 +127,45 @@ public class TaskStateService {
     }
 
     /**
-     * 停机/中断回收：PROCESSING -> PENDING，不消耗重试次数。
-     * 任务不会被直接放回内存队列，等待下次启动加载或补偿扫描。
+     * 停机回写：把内存队列里尚未消费的任务批量置回 PENDING，保证重启后能被重新加载执行。
+     *
+     * <p>这些任务在数据库中本来就是 PENDING，此处的批量更新是显式收敛状态与更新时间，
+     * 也防止停机前发生过状态漂移。</p>
+     *
+     * @param taskIds 待回写任务ID
+     * @return 实际更新的行数
      */
     @Transactional
-    public void releaseToPending(String taskId, String reason) {
+    public int resetToPending(Collection<String> taskIds) {
+        if (taskIds == null || taskIds.isEmpty()) {
+            return 0;
+        }
+        List<String> ids = new ArrayList<>(taskIds);
+        LocalDateTime now = LocalDateTime.now();
+        int updated = 0;
+        for (int from = 0; from < ids.size(); from += BATCH_UPDATE_SIZE) {
+            int to = Math.min(from + BATCH_UPDATE_SIZE, ids.size());
+            updated += taskRepository.updateStatusByTaskIds(ids.subList(from, to), TaskStatus.PENDING, now);
+        }
+        return updated;
+    }
+
+    /**
+     * 停机超时强制中断：把正在执行的任务标记为 FAILED 并记录原因。
+     *
+     * <p>与可重试失败不同，这里不重新排期：强制中断往往意味着任务本身过慢，
+     * 继续自动重试容易在下次停机时重复触发。</p>
+     */
+    @Transactional
+    public void markFailed(String taskId, String failReason) {
         TaskEntity task = taskRepository.findById(taskId).orElse(null);
         if (task == null || task.getStatus() != TaskStatus.PROCESSING) {
             return;
         }
-        task.setStatus(TaskStatus.PENDING);
-        task.setNextExecuteTime(LocalDateTime.now());
-        task.setFailReason(truncate(reason));
+        task.setStatus(TaskStatus.FAILED);
+        task.setFailReason(truncate(failReason));
         taskRepository.save(task);
-        log.info("任务已回置为待执行: taskId={}, reason={}", taskId, reason);
+        log.error("任务执行被强制中断，标记为失败: taskId={}, reason={}", taskId, failReason);
     }
 
     private void markDeadLetter(TaskEntity task, String failReason) {

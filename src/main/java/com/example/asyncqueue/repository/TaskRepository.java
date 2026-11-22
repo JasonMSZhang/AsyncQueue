@@ -59,6 +59,18 @@ public interface TaskRepository extends JpaRepository<TaskEntity, String> {
                   @Param("updateTime") LocalDateTime updateTime);
 
     /**
+     * 批量更新任务状态，用于优雅停机时把内存队列中的任务回写为 PENDING。
+     *
+     * @return 受影响行数
+     */
+    @Modifying
+    @Query("update TaskEntity t set t.status = :status, t.updateTime = :updateTime "
+            + "where t.taskId in :taskIds")
+    int updateStatusByTaskIds(@Param("taskIds") Collection<String> taskIds,
+                              @Param("status") TaskStatus status,
+                              @Param("updateTime") LocalDateTime updateTime);
+
+    /**
      * 幂等查询的便捷方法：未结束 = PENDING / PROCESSING。
      */
     default Optional<TaskEntity> findUnfinishedByBusinessKey(String businessKey) {

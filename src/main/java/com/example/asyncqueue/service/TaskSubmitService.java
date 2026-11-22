@@ -2,6 +2,8 @@ package com.example.asyncqueue.service;
 
 import com.example.asyncqueue.entity.TaskEntity;
 import com.example.asyncqueue.enums.TaskStatus;
+import com.example.asyncqueue.exception.TaskSubmitClosedException;
+import com.example.asyncqueue.lifecycle.TaskSubmissionGate;
 import com.example.asyncqueue.queue.BoundedPriorityTaskQueue;
 import com.example.asyncqueue.queue.TaskQueueFullException;
 import com.example.asyncqueue.repository.TaskRepository;
@@ -38,6 +40,9 @@ public class TaskSubmitService {
 
     private final BoundedPriorityTaskQueue taskQueue;
 
+    /** 停机开关：关闭后拒绝所有新提交 */
+    private final TaskSubmissionGate submissionGate;
+
     /**
      * 专用于「落库」的事务模板。
      *
@@ -48,9 +53,11 @@ public class TaskSubmitService {
 
     public TaskSubmitService(TaskRepository taskRepository,
                              BoundedPriorityTaskQueue taskQueue,
+                             TaskSubmissionGate submissionGate,
                              PlatformTransactionManager transactionManager) {
         this.taskRepository = taskRepository;
         this.taskQueue = taskQueue;
+        this.submissionGate = submissionGate;
         this.insertTransactionTemplate = new TransactionTemplate(transactionManager);
         this.insertTransactionTemplate.setPropagationBehavior(TransactionDefinition.PROPAGATION_REQUIRES_NEW);
     }
@@ -66,6 +73,11 @@ public class TaskSubmitService {
      * @throws TaskQueueFullException 任务已落库，但内存队列已满（背压）
      */
     public String submitTask(String businessKey, String paramJson, int priority, int maxRetry) {
+        // 0. 停机开关：必须在任何落库动作之前拒绝，保证停机后不再产生新任务
+        if (!submissionGate.isAccepting()) {
+            throw new TaskSubmitClosedException("服务正在停机，暂不接收新任务");
+        }
+
         Assert.hasText(businessKey, "businessKey 不能为空");
         Assert.hasText(paramJson, "paramJson 不能为空");
         Assert.isTrue(maxRetry >= 0, "maxRetry 不能小于 0");

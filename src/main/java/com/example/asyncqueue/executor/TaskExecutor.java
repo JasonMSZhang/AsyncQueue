@@ -28,6 +28,7 @@ import java.util.concurrent.LinkedBlockingQueue;
 import java.util.concurrent.ThreadFactory;
 import java.util.concurrent.ThreadPoolExecutor;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
 
 /**
@@ -69,6 +70,9 @@ public class TaskExecutor implements ApplicationRunner {
 
     /** 运行标记，停机时置 false，让 take() 返回后不再继续循环 */
     private volatile boolean running;
+
+    /** 停机幂等标记，避免 SmartLifecycle 与 @PreDestroy 重复关闭 */
+    private final AtomicBoolean shutdownStarted = new AtomicBoolean(false);
 
     public TaskExecutor(BoundedPriorityTaskQueue taskQueue,
                         TaskRepository taskRepository,
@@ -135,6 +139,10 @@ public class TaskExecutor implements ApplicationRunner {
                 Thread.currentThread().interrupt();
                 break;
             }
+            if (task == null) {
+                // 队列已关闭且为空，停机时正常退出
+                break;
+            }
             try {
                 process(task);
             } catch (Throwable t) {
@@ -174,12 +182,12 @@ public class TaskExecutor implements ApplicationRunner {
             taskStateService.handleFailure(taskId, e.getMessage(), false);
 
         } catch (InterruptedException e) {
-            // 停机中断：先回置 PENDING，再恢复中断标记，避免影响后续 DB 操作
-            log.info("任务执行被中断，回置为待执行: taskId={}", taskId);
+            // 停机超时被强制中断：按需求标记失败并记录原因（不再自动重试）
+            log.warn("任务执行被强制中断，标记失败: taskId={}", taskId);
             try {
-                taskStateService.releaseToPending(taskId, "消费线程被中断（停机）");
+                taskStateService.markFailed(taskId, "优雅停机超时，任务被强制中断");
             } catch (Exception ex) {
-                log.error("中断回写失败: taskId={}", taskId, ex);
+                log.error("中断后标记失败时出现异常: taskId={}", taskId, ex);
             } finally {
                 Thread.currentThread().interrupt();
             }
@@ -321,25 +329,49 @@ public class TaskExecutor implements ApplicationRunner {
     }
 
     /**
-     * 停机：中断阻塞在 take() 的消费线程；未完成的任务由中断分支回置 PENDING。
-     * 队列中的任务本来就是 PENDING，无需回写。
+     * 关闭消费线程池。
+     *
+     * <p>先 {@code shutdown()} 不再接收新 worker，并等待在途任务自然执行完成；
+     * 超过 timeoutSeconds 仍未退出则 {@code shutdownNow()} 强制中断，
+     * 被中断的任务由 {@link #process(TaskEntity)} 标记为 FAILED 并记录原因。</p>
+     *
+     * <p>调用前应由停机编排器先 drainAll() 并 close() 队列，空闲消费者才能立即退出。</p>
      */
-    @PreDestroy
-    public void stop() {
+    public void shutdown(long timeoutSeconds) {
+        if (!shutdownStarted.compareAndSet(false, true)) {
+            return;
+        }
         running = false;
         ThreadPoolExecutor pool = this.workerPool;
         if (pool == null) {
             return;
         }
-        pool.shutdownNow();
+        log.info("开始关闭消费线程池: timeout={}s", timeoutSeconds);
+        // 不中断正在执行的任务，只停止接收新的 worker 任务
+        pool.shutdown();
         try {
-            if (!pool.awaitTermination(shutdownTimeoutSeconds, TimeUnit.SECONDS)) {
-                log.warn("消费线程池未在 {} 秒内退出", shutdownTimeoutSeconds);
+            if (!pool.awaitTermination(timeoutSeconds, TimeUnit.SECONDS)) {
+                log.warn("消费线程未在 {}s 内结束，执行 shutdownNow 强制中断", timeoutSeconds);
+                List<Runnable> dropped = pool.shutdownNow();
+                log.warn("强制中断完成: 未开始执行的 worker 数={}", dropped.size());
+                // 给中断分支回写任务状态留出时间
+                pool.awaitTermination(3, TimeUnit.SECONDS);
             }
         } catch (InterruptedException e) {
+            log.warn("等待消费线程退出时被中断，执行 shutdownNow");
+            pool.shutdownNow();
             Thread.currentThread().interrupt();
         }
         log.info("任务消费线程池已停止");
+    }
+
+    /**
+     * 兜底关闭：正常停机由 GracefulShutdownManager 调用 {@link #shutdown(long)}，
+     * 这里防止其他关闭路径漏掉线程池回收。
+     */
+    @PreDestroy
+    public void stop() {
+        shutdown(shutdownTimeoutSeconds);
     }
 
     /**
