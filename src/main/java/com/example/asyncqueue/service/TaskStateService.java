@@ -5,6 +5,8 @@ import com.example.asyncqueue.entity.TaskResultEntity;
 import com.example.asyncqueue.enums.TaskStatus;
 import com.example.asyncqueue.repository.TaskRepository;
 import com.example.asyncqueue.repository.TaskResultRepository;
+import io.micrometer.core.instrument.Counter;
+import io.micrometer.core.instrument.MeterRegistry;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.beans.factory.annotation.Value;
 import org.springframework.stereotype.Service;
@@ -36,14 +38,21 @@ public class TaskStateService {
     private final long retryBaseDelaySeconds;
     private final long retryMaxDelaySeconds;
 
+    /** 重试计数：每次安排重试累加 */
+    private final Counter retryCounter;
+
     public TaskStateService(TaskRepository taskRepository,
                             TaskResultRepository taskResultRepository,
+                            MeterRegistry meterRegistry,
                             @Value("${async-queue.retry.base-delay-seconds:1}") long retryBaseDelaySeconds,
                             @Value("${async-queue.retry.max-delay-seconds:60}") long retryMaxDelaySeconds) {
         this.taskRepository = taskRepository;
         this.taskResultRepository = taskResultRepository;
         this.retryBaseDelaySeconds = retryBaseDelaySeconds;
         this.retryMaxDelaySeconds = retryMaxDelaySeconds;
+        this.retryCounter = Counter.builder("async.task.retry")
+                .description("任务安排重试的总次数")
+                .register(meterRegistry);
     }
 
     /**
@@ -122,6 +131,7 @@ public class TaskStateService {
         task.setNextExecuteTime(LocalDateTime.now().plusSeconds(delaySeconds));
         task.setFailReason(truncate(failReason));
         taskRepository.save(task);
+        retryCounter.increment();
         log.warn("任务失败，安排第 {} 次重试: taskId={}, delay={}s, nextExecuteTime={}, reason={}",
                 nextRetry, taskId, delaySeconds, task.getNextExecuteTime(), failReason);
     }

@@ -10,6 +10,7 @@ import jakarta.persistence.Lob;
 import jakarta.persistence.PrePersist;
 import jakarta.persistence.PreUpdate;
 import jakarta.persistence.Table;
+import jakarta.persistence.Transient;
 import lombok.AllArgsConstructor;
 import lombok.Builder;
 import lombok.Getter;
@@ -77,6 +78,12 @@ public class TaskEntity {
 
     @Column(name = "update_time", nullable = false)
     private LocalDateTime updateTime;
+
+    /**
+     * 进入内存队列的时间戳（毫秒），仅用于统计排队时长，不持久化。
+     */
+    @Transient
+    private Long enqueueTimeMillis;
 
     @PrePersist
     void prePersist() {

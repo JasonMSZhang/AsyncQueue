@@ -13,6 +13,8 @@ import com.example.asyncqueue.service.TaskStateService;
 import com.fasterxml.jackson.annotation.JsonIgnoreProperties;
 import com.fasterxml.jackson.core.JsonProcessingException;
 import com.fasterxml.jackson.databind.ObjectMapper;
+import io.micrometer.core.instrument.MeterRegistry;
+import io.micrometer.core.instrument.Timer;
 import jakarta.annotation.PreDestroy;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.beans.factory.annotation.Value;
@@ -21,6 +23,7 @@ import org.springframework.boot.ApplicationRunner;
 import org.springframework.data.domain.PageRequest;
 import org.springframework.stereotype.Component;
 
+import java.time.Duration;
 import java.time.LocalDateTime;
 import java.util.ArrayList;
 import java.util.List;
@@ -65,6 +68,10 @@ public class TaskExecutor implements ApplicationRunner {
     private final long simulateIoMillis;
     private final long shutdownTimeoutSeconds;
 
+    /** 排队时长 / 处理时长指标 */
+    private final Timer queueWaitTimer;
+    private final Timer processTimer;
+
     /** 消费线程池；worker 是长循环，任务数固定等于线程数 */
     private ThreadPoolExecutor workerPool;
 
@@ -74,11 +81,15 @@ public class TaskExecutor implements ApplicationRunner {
     /** 停机幂等标记，避免 SmartLifecycle 与 @PreDestroy 重复关闭 */
     private final AtomicBoolean shutdownStarted = new AtomicBoolean(false);
 
+    /** 当前正在执行任务的线程数（线程池 getActiveCount 会因为 worker 长循环恒等于线程总数，不可用） */
+    private final AtomicInteger busyWorkers = new AtomicInteger();
+
     public TaskExecutor(BoundedPriorityTaskQueue taskQueue,
                         TaskRepository taskRepository,
                         TaskStateService taskStateService,
                         AbTestBucketService abTestBucketService,
                         ObjectMapper objectMapper,
+                        MeterRegistry meterRegistry,
                         @Value("${async-queue.executor.worker-count:16}") int workerCount,
                         @Value("${async-queue.executor.simulate-io-millis:50}") long simulateIoMillis,
                         @Value("${async-queue.executor.shutdown-timeout-seconds:20}") long shutdownTimeoutSeconds) {
@@ -93,6 +104,12 @@ public class TaskExecutor implements ApplicationRunner {
         this.workerCount = workerCount;
         this.simulateIoMillis = simulateIoMillis;
         this.shutdownTimeoutSeconds = shutdownTimeoutSeconds;
+        this.queueWaitTimer = Timer.builder("async.task.queue.wait")
+                .description("任务从入队到开始处理的排队时长")
+                .register(meterRegistry);
+        this.processTimer = Timer.builder("async.task.process")
+                .description("任务处理时长（含持久化）")
+                .register(meterRegistry);
     }
 
     /**
@@ -155,6 +172,12 @@ public class TaskExecutor implements ApplicationRunner {
     private void process(TaskEntity task) {
         String taskId = task.getTaskId();
 
+        // 排队时长：入队时间由提交方/启动加载写入（transient 字段）
+        Long enqueueTimeMillis = task.getEnqueueTimeMillis();
+        if (enqueueTimeMillis != null) {
+            queueWaitTimer.record(Duration.ofMillis(Math.max(0, System.currentTimeMillis() - enqueueTimeMillis)));
+        }
+
         // 1. CAS 领取：只有 PENDING 才能变成 PROCESSING，避免重复执行
         if (!taskStateService.markProcessing(taskId)) {
             log.debug("任务状态已变更，跳过本次执行: taskId={}", taskId);
@@ -162,6 +185,7 @@ public class TaskExecutor implements ApplicationRunner {
         }
 
         long startMillis = System.currentTimeMillis();
+        busyWorkers.incrementAndGet();
         try {
             // 2. 执行 AB-Test 分桶业务
             String resultJson = executeBusiness(task);
@@ -196,7 +220,19 @@ public class TaskExecutor implements ApplicationRunner {
             // 未知异常按系统可恢复处理：可能是一次瞬时故障
             log.error("任务执行出现未知异常，按系统可恢复处理: taskId={}", taskId, e);
             taskStateService.handleFailure(taskId, "未知异常: " + e.getMessage(), true);
+
+        } finally {
+            // 4. 处理时长（含持久化），无论成功失败都记录
+            busyWorkers.decrementAndGet();
+            processTimer.record(Duration.ofMillis(System.currentTimeMillis() - startMillis));
         }
+    }
+
+    /**
+     * 当前正在执行任务的消费线程数，供 Micrometer Gauge 使用。
+     */
+    public int getBusyThreadCount() {
+        return busyWorkers.get();
     }
 
     /**
@@ -292,6 +328,8 @@ public class TaskExecutor implements ApplicationRunner {
             }
             int offeredInBatch = 0;
             for (TaskEntity task : batch) {
+                // 记录入队时间，用于排队时长指标
+                task.setEnqueueTimeMillis(System.currentTimeMillis());
                 if (offerWithRetry(task)) {
                     offeredInBatch++;
                 }

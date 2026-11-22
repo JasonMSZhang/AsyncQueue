@@ -7,6 +7,8 @@ import com.example.asyncqueue.lifecycle.TaskSubmissionGate;
 import com.example.asyncqueue.queue.BoundedPriorityTaskQueue;
 import com.example.asyncqueue.queue.TaskQueueFullException;
 import com.example.asyncqueue.repository.TaskRepository;
+import io.micrometer.core.instrument.Counter;
+import io.micrometer.core.instrument.MeterRegistry;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.PlatformTransactionManager;
@@ -51,15 +53,28 @@ public class TaskSubmitService {
      */
     private final TransactionTemplate insertTransactionTemplate;
 
+    /** 提交成功 / 失败计数 */
+    private final Counter submitSuccessCounter;
+    private final Counter submitFailureCounter;
+
     public TaskSubmitService(TaskRepository taskRepository,
                              BoundedPriorityTaskQueue taskQueue,
                              TaskSubmissionGate submissionGate,
-                             PlatformTransactionManager transactionManager) {
+                             PlatformTransactionManager transactionManager,
+                             MeterRegistry meterRegistry) {
         this.taskRepository = taskRepository;
         this.taskQueue = taskQueue;
         this.submissionGate = submissionGate;
         this.insertTransactionTemplate = new TransactionTemplate(transactionManager);
         this.insertTransactionTemplate.setPropagationBehavior(TransactionDefinition.PROPAGATION_REQUIRES_NEW);
+        this.submitSuccessCounter = Counter.builder("async.task.submit")
+                .tag("result", "success")
+                .description("任务提交成功次数")
+                .register(meterRegistry);
+        this.submitFailureCounter = Counter.builder("async.task.submit")
+                .tag("result", "failure")
+                .description("任务提交失败次数")
+                .register(meterRegistry);
     }
 
     /**
@@ -73,6 +88,17 @@ public class TaskSubmitService {
      * @throws TaskQueueFullException 任务已落库，但内存队列已满（背压）
      */
     public String submitTask(String businessKey, String paramJson, int priority, int maxRetry) {
+        try {
+            String taskId = doSubmitTask(businessKey, paramJson, priority, maxRetry);
+            submitSuccessCounter.increment();
+            return taskId;
+        } catch (RuntimeException e) {
+            submitFailureCounter.increment();
+            throw e;
+        }
+    }
+
+    private String doSubmitTask(String businessKey, String paramJson, int priority, int maxRetry) {
         // 0. 停机开关：必须在任何落库动作之前拒绝，保证停机后不再产生新任务
         if (!submissionGate.isAccepting()) {
             throw new TaskSubmitClosedException("服务正在停机，暂不接收新任务");
@@ -100,6 +126,8 @@ public class TaskSubmitService {
 
         // 3. 再入内存队列；此处失败只影响执行时延，不影响任务是否被记住
         try {
+            // 记录入队时间，用于统计排队时长
+            saved.setEnqueueTimeMillis(System.currentTimeMillis());
             taskQueue.offer(saved);
             log.info("任务入队成功: taskId={}, queueSize={}/{}",
                     saved.getTaskId(), taskQueue.size(), taskQueue.getCapacity());

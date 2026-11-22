@@ -73,6 +73,13 @@ public class AbTestBucketService {
         return cache.get(cacheKey, key -> compute(uid, expId));
     }
 
+    /**
+     * 是否支持该实验ID，供接口层提前校验，避免无效任务进入死信。
+     */
+    public boolean supports(String expId) {
+        return expId != null && TREATMENT_BUCKET_LIMITS.containsKey(expId);
+    }
+
     private BucketResult compute(String uid, String expId) {
         Integer limit = TREATMENT_BUCKET_LIMITS.get(expId);
         if (limit == null) {

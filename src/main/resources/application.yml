@@ -71,6 +71,19 @@ async-queue:
     ttl-seconds: 180
     max-size: 200000
 
+management:
+  endpoints:
+    web:
+      exposure:
+        # 对外暴露 Prometheus 抓取端点 /actuator/prometheus
+        include: health,info,metrics,prometheus
+  endpoint:
+    health:
+      show-details: always
+  metrics:
+    tags:
+      application: async-queue
+
 logging:
   level:
     root: INFO
