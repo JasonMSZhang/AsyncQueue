@@ -48,6 +48,11 @@ spring:
       settings:
         web-allow-others: false
 
+async-queue:
+  queue:
+    # 有界优先级队列容量；满时任务提交侧触发背压（任务已在库，不会丢失）
+    capacity: 4096
+
 logging:
   level:
     root: INFO
