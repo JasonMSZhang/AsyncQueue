@@ -41,6 +41,12 @@ public class TaskStateService {
     /** 重试计数：每次安排重试累加 */
     private final Counter retryCounter;
 
+    /** 任务执行结果计数：成功 / 安排重试 / 死信 / 强制失败 */
+    private final Counter execSuccessCounter;
+    private final Counter execRetryCounter;
+    private final Counter execDeadCounter;
+    private final Counter execFailedCounter;
+
     public TaskStateService(TaskRepository taskRepository,
                             TaskResultRepository taskResultRepository,
                             MeterRegistry meterRegistry,
@@ -53,6 +59,17 @@ public class TaskStateService {
         this.retryCounter = Counter.builder("async.task.retry")
                 .description("任务安排重试的总次数")
                 .register(meterRegistry);
+        this.execSuccessCounter = execCounter(meterRegistry, "success");
+        this.execRetryCounter = execCounter(meterRegistry, "retry");
+        this.execDeadCounter = execCounter(meterRegistry, "dead_letter");
+        this.execFailedCounter = execCounter(meterRegistry, "failed");
+    }
+
+    private static Counter execCounter(MeterRegistry registry, String result) {
+        return Counter.builder("async.task.exec")
+                .tag("result", result)
+                .description("任务执行结果计数")
+                .register(registry);
     }
 
     /**
@@ -108,6 +125,7 @@ public class TaskStateService {
         task.setStatus(TaskStatus.SUCCESS);
         task.setFailReason(null);
         taskRepository.save(task);
+        execSuccessCounter.increment();
         log.info("任务执行成功: taskId={}", taskId);
     }
 
@@ -149,6 +167,7 @@ public class TaskStateService {
         task.setFailReason(truncate(failReason));
         taskRepository.save(task);
         retryCounter.increment();
+        execRetryCounter.increment();
         log.warn("任务失败，安排第 {} 次重试: taskId={}, delay={}s, nextExecuteTime={}, reason={}",
                 nextRetry, taskId, delaySeconds, task.getNextExecuteTime(), failReason);
     }
@@ -192,6 +211,7 @@ public class TaskStateService {
         task.setStatus(TaskStatus.FAILED);
         task.setFailReason(truncate(failReason));
         taskRepository.save(task);
+        execFailedCounter.increment();
         log.error("任务执行被强制中断，标记为失败: taskId={}, reason={}", taskId, failReason);
     }
 
@@ -199,6 +219,7 @@ public class TaskStateService {
         task.setStatus(TaskStatus.DEAD_LETTER);
         task.setFailReason(truncate(failReason));
         taskRepository.save(task);
+        execDeadCounter.increment();
         log.error("任务进入死信: taskId={}, retryCount={}, reason={}",
                 task.getTaskId(), task.getRetryCount(), failReason);
     }

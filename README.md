@@ -14,6 +14,21 @@
 - **本地缓存**：Caffeine，key=`uid:expId`，TTL 180 秒
 - **可观测**：Micrometer + Actuator，暴露 `/actuator/prometheus`
 
+## 场景与任务模型
+
+**场景**：AB-Test 分桶计算。客户端提交「用户 + 实验列表」，服务端异步计算每个实验的桶号与分组，结果可查。
+
+| 项 | 说明 |
+| --- | --- |
+| 任务类型 | CPU 计算 + 本地缓存 + 模拟 IO 的混合任务 |
+| 输入 | `uid`、`expIdList`（test1~test10）、`priority`、`maxRetry` |
+| 输出 | 每个实验的 `bucket`（0~9999）与 `treatment` / `control` |
+| 耗时特征 | MurmurHash3 为微秒级；Caffeine 为内存访问；默认 `Thread.sleep(50ms)` 模拟 IO；结果落库约 5~20ms |
+| 失败概率 | 正常输入不失败；通过 uid 前缀**确定性**注入故障（`biz-retry*` 业务可重试、`sys-db*` 系统可恢复、`fatal*` 不可恢复），保证可复现；生产环境可替换为按比例随机注入 |
+| 并发模型 | 等待占比高，按 `N = CPU × (1 + W/C)` 取 16 个消费线程；H2 单写者是真实瓶颈，线程再多只会加剧写锁竞争 |
+| 接收成功边界 | 返回 200/202 代表 H2 事务已提交；返回 429（队列满）时任务同样已提交；只有 400/503 代表未接收 |
+| 快速返回 | 提交接口只做「参数校验 + 一次 INSERT + 尝试入队」，不做任何业务计算，耗时在毫秒级 |
+
 ## 技术栈
 
 | 组件 | 版本 / 说明 |
@@ -136,7 +151,12 @@ curl -X POST http://localhost:8080/task/submit \
 | `priority` | 否 | 0~9，数值越大越先执行，默认 5 |
 | `maxRetry` | 否 | 最大重试次数，默认 3 |
 
-业务键由服务端生成：`md5("u:" + uid + ":" + 排序后的实验ID列表)`。相同 uid 与实验列表在任务未结束时会复用同一个 taskId。
+业务键由服务端生成：`md5("u:" + uid + ":" + 排序后的实验ID列表)`。
+
+幂等规则（明确约定）：
+
+- 同一 businessKey 存在 `PENDING` / `PROCESSING` 任务时，直接返回已有 taskId，不新建；
+- 任务已进入终态（`SUCCESS` / `FAILED` / `DEAD_LETTER`）后，再次提交视为一次**新的计算请求**，生成新的 taskId。
 
 ### 查询任务详情
 
@@ -220,11 +240,11 @@ curl -X POST http://localhost:8080/task/submit \
 | `async-queue.scheduler.recovery-batch-size` | 200 | 单轮最多投递任务数 |
 | `async-queue.cache.ttl-seconds` | 180 | AB 分桶缓存 TTL |
 | `async-queue.cache.max-size` | 200000 | AB 分桶缓存最大条目 |
-| `spring.datasource.url` | `jdbc:h2:file:./data/abtask;DB_CLOSE_DELAY=-1;DB_CLOSE_ON_EXIT=FALSE` | H2 文件库 |
+| `spring.datasource.url` | `jdbc:h2:file:./data/abtask;DB_CLOSE_DELAY=-1;DB_CLOSE_ON_EXIT=FALSE;WRITE_DELAY=0` | H2 文件库，提交即落盘 |
 
 > `DB_CLOSE_ON_EXIT=FALSE` 必须保留。否则 JVM 收到 SIGTERM 时，H2 自身的 shutdown hook 会与 Spring 优雅停机并发执行，可能先关闭数据库，导致队列回写和在途任务状态回写失败。
-
-严格「接口返回即落盘」可在 JDBC URL 末尾追加 `;WRITE_DELAY=0`（会降低写入吞吐）。
+>
+> `WRITE_DELAY=0` 关闭 H2 默认的约 500ms 异步刷盘窗口，保证「事务提交成功即落盘」，代价是写入吞吐下降。
 
 ## 可观测指标
 
@@ -234,9 +254,12 @@ curl -X POST http://localhost:8080/task/submit \
 | `async_queue_capacity` | Gauge | 队列容量 |
 | `async_executor_active_threads` | Gauge | 正在执行任务的消费线程数 |
 | `async_task_submit_total{result}` | Counter | 提交成功 / 失败次数 |
+| `async_task_exec_total{result}` | Counter | 任务执行结果：success / retry / dead_letter / failed |
 | `async_task_retry_total` | Counter | 安排重试的总次数 |
 | `async_task_queue_wait_seconds` | Timer | 入队到开始处理的排队时长 |
+| `async_task_queue_wait_avg` | Gauge | 平均排队时长（毫秒） |
 | `async_task_process_seconds` | Timer | 任务处理时长（含持久化） |
+| `async_task_process_avg` | Gauge | 平均处理时长（毫秒） |
 
 查看：
 

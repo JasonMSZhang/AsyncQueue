@@ -11,10 +11,10 @@ spring:
     timeout-per-shutdown-phase: 30s
 
   datasource:
-    # H2 文件模式；如需“事务提交即落盘”（返回即不丢），在末尾追加 ;WRITE_DELAY=0（会降低写入吞吐）
+    # H2 文件模式；WRITE_DELAY=0 表示事务提交立即落盘，保证「提交成功即不丢失」，代价是写入吞吐下降
     # DB_CLOSE_ON_EXIT=FALSE 必须保留：否则 JVM 收到 SIGTERM 时 H2 会先于 Spring 优雅停机关闭数据库，
     # 导致队列回写、在途任务状态回写失败
-    url: jdbc:h2:file:./data/abtask;DB_CLOSE_DELAY=-1;DB_CLOSE_ON_EXIT=FALSE
+    url: jdbc:h2:file:./data/abtask;DB_CLOSE_DELAY=-1;DB_CLOSE_ON_EXIT=FALSE;WRITE_DELAY=0
     driver-class-name: org.h2.Driver
     username: sa
     password: ""

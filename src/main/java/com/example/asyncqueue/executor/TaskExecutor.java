@@ -13,6 +13,7 @@ import com.example.asyncqueue.service.TaskStateService;
 import com.fasterxml.jackson.annotation.JsonIgnoreProperties;
 import com.fasterxml.jackson.core.JsonProcessingException;
 import com.fasterxml.jackson.databind.ObjectMapper;
+import io.micrometer.core.instrument.Gauge;
 import io.micrometer.core.instrument.MeterRegistry;
 import io.micrometer.core.instrument.Timer;
 import jakarta.annotation.PreDestroy;
@@ -111,6 +112,16 @@ public class TaskExecutor implements ApplicationRunner {
                 .register(meterRegistry);
         this.processTimer = Timer.builder("async.task.process")
                 .description("任务处理时长（含持久化）")
+                .register(meterRegistry);
+
+        // 需求要求直接暴露平均排队/处理时长：由 Timer 的 sum/count 计算，毫秒
+        Gauge.builder("async.task.queue.wait.avg", queueWaitTimer,
+                        timer -> timer.mean(TimeUnit.MILLISECONDS))
+                .description("平均排队时长（毫秒）")
+                .register(meterRegistry);
+        Gauge.builder("async.task.process.avg", processTimer,
+                        timer -> timer.mean(TimeUnit.MILLISECONDS))
+                .description("平均处理时长（毫秒）")
                 .register(meterRegistry);
     }
 

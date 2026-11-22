@@ -320,6 +320,40 @@
 
 ---
 
+## 第 16 轮：按 PDF 做符合性检查与修复
+
+### Prompt
+
+> 这个是系统需求文档，再检查一下，如果有哪些不符合系统的设计要求和测试不通过的，重新修复一下。
+
+### AI 返回（关键片段）
+
+对照 PDF 逐条核查后，发现并修复 5 处：
+
+1. **可观测性缺「成功/失败计数」**：原只有提交成功/失败计数，补充任务执行结果计数
+   `async.task.exec{result=success|retry|dead_letter|failed}`，在 `TaskStateService` 的各状态出口打点。
+2. **缺「平均排队时长 / 平均处理时长」的显式指标**：补充 Gauge
+   `async.task.queue.wait.avg`、`async.task.process.avg`（毫秒，由 Timer 的 sum/count 计算）。
+3. **文档缺「场景与任务模型」**：README 新增一节，明确任务类型、输入输出、耗时特征、失败概率、
+   并发模型（CPU+IO 混合 → 线程数 16）、接收成功的持久化边界、提交接口快速返回的依据。
+4. **「任务一旦入队不丢失」的严格性不足**：H2 默认 `WRITE_DELAY≈500ms`，崩溃可能丢最后 0.5s 的提交；
+   默认 URL 改为 `...;DB_CLOSE_ON_EXIT=FALSE;WRITE_DELAY=0`，提交即落盘。
+5. **幂等规则表述不清晰**：README 明确约定「未完成复用同一 taskId；终态后再次提交视为新的计算请求」。
+
+其余需求（优先级、容量可配置、背压、异常分类、退避重试 + 死信、状态与结果查询、状态统计、
+优雅停机、两张表分离、启动自动建表、无 MQ、单测与并发测试、Git 记录、AI 对话记录）均已满足。
+
+验证：`mvn test` 17 个用例全部通过；运行时确认新指标有值：
+
+```
+async_task_exec_total{result="success"} 1.0
+async_task_exec_total{result="retry"} 0.0
+async_task_process_avg 130.0
+async_task_queue_wait_avg 0.0
+```
+
+---
+
 ## 附：最终代码结构
 
 ```
@@ -360,4 +394,4 @@ src/test/java/com/example/asyncqueue/
 | 缓存 TTL / 上限 | 180s / 200000 |
 | 重试退避 | base 1s，×2，上限 60s |
 | 停机预算 | 停机流程 20s + 3s，生命周期上限 30s |
-| H2 URL | `jdbc:h2:file:./data/abtask;DB_CLOSE_DELAY=-1` |
+| H2 URL | `jdbc:h2:file:./data/abtask;DB_CLOSE_DELAY=-1;DB_CLOSE_ON_EXIT=FALSE;WRITE_DELAY=0` |
