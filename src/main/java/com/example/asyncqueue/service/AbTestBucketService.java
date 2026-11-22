@@ -4,6 +4,7 @@ import com.example.asyncqueue.exception.UnrecoverableTaskException;
 import com.example.asyncqueue.util.MurmurHash3;
 import com.github.benmanes.caffeine.cache.Cache;
 import com.github.benmanes.caffeine.cache.Caffeine;
+import com.github.benmanes.caffeine.cache.stats.CacheStats;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.beans.factory.annotation.Value;
 import org.springframework.stereotype.Service;
@@ -78,6 +79,13 @@ public class AbTestBucketService {
      */
     public boolean supports(String expId) {
         return expId != null && TREATMENT_BUCKET_LIMITS.containsKey(expId);
+    }
+
+    /**
+     * 缓存统计（命中率、加载次数等），供监控与测试使用。
+     */
+    public CacheStats cacheStats() {
+        return cache.stats();
     }
 
     private BucketResult compute(String uid, String expId) {
