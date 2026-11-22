@@ -1,0 +1,57 @@
+server:
+  port: 8080
+  # 优雅停机：先停止接收新请求，再走 Spring 生命周期关闭流程
+  shutdown: graceful
+
+spring:
+  application:
+    name: async-queue
+
+  lifecycle:
+    timeout-per-shutdown-phase: 30s
+
+  datasource:
+    # H2 文件模式；如需“事务提交即落盘”（返回即不丢），在末尾追加 ;WRITE_DELAY=0（会降低写入吞吐）
+    url: jdbc:h2:file:./data/abtask;DB_CLOSE_DELAY=-1
+    driver-class-name: org.h2.Driver
+    username: sa
+    password: ""
+    hikari:
+      pool-name: AsyncQueueHikari
+      maximum-pool-size: 16
+      minimum-idle: 4
+      connection-timeout: 3000
+      idle-timeout: 600000
+      max-lifetime: 1800000
+
+  jpa:
+    # 建表交由 schema-h2.sql 负责，避免 Hibernate 自动生成与手写 DDL 冲突
+    hibernate:
+      ddl-auto: none
+    open-in-view: false
+    show-sql: false
+    properties:
+      hibernate:
+        format_sql: true
+
+  sql:
+    init:
+      mode: always
+      schema-locations: classpath:schema-h2.sql
+      encoding: UTF-8
+      continue-on-error: false
+
+  h2:
+    console:
+      enabled: true
+      path: /h2-console
+      settings:
+        web-allow-others: false
+
+logging:
+  level:
+    root: INFO
+    com.example.asyncqueue: DEBUG
+    org.hibernate.SQL: INFO
+  pattern:
+    console: "%d{yyyy-MM-dd HH:mm:ss.SSS} [%thread] %-5level %logger{36} - %msg%n"
