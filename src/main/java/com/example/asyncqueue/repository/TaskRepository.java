@@ -5,6 +5,9 @@ import com.example.asyncqueue.enums.TaskStatus;
 import org.springframework.data.domain.PageRequest;
 import org.springframework.data.domain.Pageable;
 import org.springframework.data.jpa.repository.JpaRepository;
+import org.springframework.data.jpa.repository.Modifying;
+import org.springframework.data.jpa.repository.Query;
+import org.springframework.data.repository.query.Param;
 
 import java.time.LocalDateTime;
 import java.util.Collection;
@@ -32,6 +35,28 @@ public interface TaskRepository extends JpaRepository<TaskEntity, String> {
      * 按状态统计任务数量。
      */
     long countByStatus(TaskStatus status);
+
+    /**
+     * 启动加载专用：按 taskId 游标分批扫描待执行任务。
+     *
+     * <p>使用游标而不是 offset 分页：加载过程中工作线程会把任务从 PENDING 改成 PROCESSING，
+     * offset 分页会因此漏读任务。</p>
+     */
+    List<TaskEntity> findByStatusAndNextExecuteTimeLessThanEqualAndTaskIdGreaterThanOrderByTaskIdAsc(
+            TaskStatus status, LocalDateTime nextExecuteTime, String taskId, Pageable pageable);
+
+    /**
+     * 状态 CAS 更新：仅当当前状态符合预期时才更新，避免同一任务被重复消费。
+     *
+     * @return 受影响行数，0 表示状态已被其他线程/实例改变
+     */
+    @Modifying
+    @Query("update TaskEntity t set t.status = :toStatus, t.updateTime = :updateTime "
+            + "where t.taskId = :taskId and t.status = :fromStatus")
+    int casStatus(@Param("taskId") String taskId,
+                  @Param("fromStatus") TaskStatus fromStatus,
+                  @Param("toStatus") TaskStatus toStatus,
+                  @Param("updateTime") LocalDateTime updateTime);
 
     /**
      * 幂等查询的便捷方法：未结束 = PENDING / PROCESSING。

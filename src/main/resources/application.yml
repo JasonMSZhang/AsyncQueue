@@ -53,6 +53,24 @@ async-queue:
     # 有界优先级队列容量；满时任务提交侧触发背压（任务已在库，不会丢失）
     capacity: 4096
 
+  executor:
+    # 任务为 CPU + IO(sleep) 混合，按 N = CPU 核数 × (1 + W/C) 估算；8 核机器取 16
+    worker-count: 16
+    # 模拟业务 IO 耗时（毫秒），0 表示不模拟
+    simulate-io-millis: 50
+    # 停机时等待消费线程退出的时间
+    shutdown-timeout-seconds: 20
+
+  retry:
+    # 指数退避：第 n 次重试等待 base × 2^(n-1) 秒，最大不超过 max-delay
+    base-delay-seconds: 1
+    max-delay-seconds: 60
+
+  cache:
+    # AB 分桶本地缓存 TTL，需求固定 180 秒
+    ttl-seconds: 180
+    max-size: 200000
+
 logging:
   level:
     root: INFO
