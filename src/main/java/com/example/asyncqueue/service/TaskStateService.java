@@ -67,6 +67,23 @@ public class TaskStateService {
     }
 
     /**
+     * 启动恢复：单实例部署下，上次进程异常退出（kill -9 / 断电）遗留的 PROCESSING 任务
+     * 已经没有执行者，统一重置为 PENDING 重新执行。
+     *
+     * <p>该策略依赖两个前提：部署为单实例；任务本身幂等（AB 分桶为纯计算，重跑安全）。</p>
+     *
+     * @return 被恢复的任务数量
+     */
+    @Transactional
+    public int recoverProcessingTasks() {
+        int recovered = taskRepository.updateAllByStatus(TaskStatus.PROCESSING, TaskStatus.PENDING, LocalDateTime.now());
+        if (recovered > 0) {
+            log.warn("启动恢复: {} 个 PROCESSING 任务重置为 PENDING（上次异常退出）", recovered);
+        }
+        return recovered;
+    }
+
+    /**
      * 执行成功：写入结果表 + 任务置 SUCCESS，同一事务内完成。
      *
      * <p>若结果已存在（历史重复执行），直接覆盖结果内容，保证 1:1 唯一约束不被破坏。</p>

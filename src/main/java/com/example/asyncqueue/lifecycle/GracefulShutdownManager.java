@@ -3,6 +3,7 @@ package com.example.asyncqueue.lifecycle;
 import com.example.asyncqueue.entity.TaskEntity;
 import com.example.asyncqueue.executor.TaskExecutor;
 import com.example.asyncqueue.queue.BoundedPriorityTaskQueue;
+import com.example.asyncqueue.scheduler.TaskRecoveryScheduler;
 import com.example.asyncqueue.service.TaskStateService;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.beans.factory.annotation.Value;
@@ -34,6 +35,7 @@ public class GracefulShutdownManager implements SmartLifecycle {
     private final BoundedPriorityTaskQueue taskQueue;
     private final TaskStateService taskStateService;
     private final TaskExecutor taskExecutor;
+    private final TaskRecoveryScheduler recoveryScheduler;
     private final long shutdownTimeoutSeconds;
 
     /** 防止 stop() 与 stop(callback) 重复执行 */
@@ -45,11 +47,13 @@ public class GracefulShutdownManager implements SmartLifecycle {
                                    BoundedPriorityTaskQueue taskQueue,
                                    TaskStateService taskStateService,
                                    TaskExecutor taskExecutor,
+                                   TaskRecoveryScheduler recoveryScheduler,
                                    @Value("${async-queue.executor.shutdown-timeout-seconds:20}") long shutdownTimeoutSeconds) {
         this.submissionGate = submissionGate;
         this.taskQueue = taskQueue;
         this.taskStateService = taskStateService;
         this.taskExecutor = taskExecutor;
+        this.recoveryScheduler = recoveryScheduler;
         this.shutdownTimeoutSeconds = shutdownTimeoutSeconds;
     }
 
@@ -103,10 +107,19 @@ public class GracefulShutdownManager implements SmartLifecycle {
         submissionGate.stopAccepting();
         log.info("已停止接收新任务");
 
+        // 1.1 先停补偿扫描器，避免回写后的任务又被重新投递
+        recoveryScheduler.stop();
+
         // 2. 导出内存队列中还未消费的任务，并批量回写为 PENDING
         List<TaskEntity> undrainedTasks = taskQueue.drainAll();
-        int writtenBack = taskStateService.resetToPending(
-                undrainedTasks.stream().map(TaskEntity::getTaskId).toList());
+        int writtenBack = 0;
+        try {
+            writtenBack = taskStateService.resetToPending(
+                    undrainedTasks.stream().map(TaskEntity::getTaskId).toList());
+        } catch (Exception e) {
+            // 这些任务入库时就是 PENDING，回写失败不影响重启恢复；但不能因此中断后续停机步骤
+            log.error("内存队列任务回写失败，任务仍以数据库中状态为准: drained={}", undrainedTasks.size(), e);
+        }
         log.info("内存队列任务回写完成: drained={}, updated={}", undrainedTasks.size(), writtenBack);
 
         // 3. 关闭队列入口并唤醒空闲消费者（队列中已无任务，take() 将返回 null）

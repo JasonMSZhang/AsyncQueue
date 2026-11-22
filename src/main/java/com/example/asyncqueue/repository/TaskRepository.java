@@ -71,6 +71,18 @@ public interface TaskRepository extends JpaRepository<TaskEntity, String> {
                               @Param("updateTime") LocalDateTime updateTime);
 
     /**
+     * 按状态批量重置，用于启动时回收上次异常退出遗留的 PROCESSING 任务（单实例部署前提）。
+     *
+     * @return 受影响行数
+     */
+    @Modifying
+    @Query("update TaskEntity t set t.status = :toStatus, t.updateTime = :updateTime "
+            + "where t.status = :fromStatus")
+    int updateAllByStatus(@Param("fromStatus") TaskStatus fromStatus,
+                          @Param("toStatus") TaskStatus toStatus,
+                          @Param("updateTime") LocalDateTime updateTime);
+
+    /**
      * 幂等查询的便捷方法：未结束 = PENDING / PROCESSING。
      */
     default Optional<TaskEntity> findUnfinishedByBusinessKey(String businessKey) {

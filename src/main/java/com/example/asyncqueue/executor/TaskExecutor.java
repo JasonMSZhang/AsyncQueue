@@ -20,6 +20,7 @@ import lombok.extern.slf4j.Slf4j;
 import org.springframework.beans.factory.annotation.Value;
 import org.springframework.boot.ApplicationArguments;
 import org.springframework.boot.ApplicationRunner;
+import org.springframework.core.annotation.Order;
 import org.springframework.data.domain.PageRequest;
 import org.springframework.stereotype.Component;
 
@@ -49,6 +50,7 @@ import java.util.concurrent.atomic.AtomicInteger;
  */
 @Slf4j
 @Component("abTaskExecutor")
+@Order(0)
 public class TaskExecutor implements ApplicationRunner {
 
     /** 启动加载的单批大小 */
@@ -119,6 +121,8 @@ public class TaskExecutor implements ApplicationRunner {
      */
     @Override
     public void run(ApplicationArguments args) {
+        // 单实例前提：上次异常退出遗留的 PROCESSING 任务没有执行者，先回收为 PENDING
+        taskStateService.recoverProcessingTasks();
         startWorkers();
         loadPendingTasks();
     }

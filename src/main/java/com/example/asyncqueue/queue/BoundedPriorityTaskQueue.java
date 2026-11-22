@@ -8,8 +8,10 @@ import java.time.LocalDateTime;
 import java.util.ArrayList;
 import java.util.Collections;
 import java.util.Comparator;
+import java.util.HashSet;
 import java.util.List;
 import java.util.Objects;
+import java.util.Set;
 import java.util.concurrent.locks.Condition;
 import java.util.concurrent.locks.ReentrantLock;
 
@@ -46,6 +48,9 @@ public class BoundedPriorityTaskQueue {
 
     /** 有序任务列表，索引 0 即为下一个要被消费的任务；仅允许持锁访问 */
     private final List<TaskEntity> tasks;
+
+    /** 当前在队列中的 taskId 集合，供补偿扫描器去重，避免同一任务被重复投递；仅允许持锁访问 */
+    private final Set<String> queuedTaskIds = new HashSet<>();
 
     /** 保护 tasks 以及 size/capacity 判断的独占锁 */
     private final ReentrantLock lock = new ReentrantLock();
@@ -97,6 +102,7 @@ public class BoundedPriorityTaskQueue {
                 index = -index - 1;
             }
             tasks.add(index, task);
+            queuedTaskIds.add(task.getTaskId());
             // 只唤醒一个消费者，减少无效竞争
             notEmpty.signal();
             return true;
@@ -122,7 +128,24 @@ public class BoundedPriorityTaskQueue {
                 }
                 notEmpty.await();
             }
-            return tasks.remove(0);
+            TaskEntity task = tasks.remove(0);
+            queuedTaskIds.remove(task.getTaskId());
+            return task;
+        } finally {
+            lock.unlock();
+        }
+    }
+
+    /**
+     * 指定任务是否仍在队列中（补偿扫描器据此避免重复投递）。
+     */
+    public boolean contains(String taskId) {
+        if (taskId == null) {
+            return false;
+        }
+        lock.lock();
+        try {
+            return queuedTaskIds.contains(taskId);
         } finally {
             lock.unlock();
         }
@@ -195,6 +218,7 @@ public class BoundedPriorityTaskQueue {
             }
             List<TaskEntity> snapshot = new ArrayList<>(tasks);
             tasks.clear();
+            queuedTaskIds.clear();
             return snapshot;
         } finally {
             lock.unlock();

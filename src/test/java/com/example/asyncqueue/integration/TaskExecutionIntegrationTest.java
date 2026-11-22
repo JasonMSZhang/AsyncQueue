@@ -76,22 +76,24 @@ class TaskExecutionIntegrationTest {
     }
 
     @Test
-    @DisplayName("可重试异常：未达上限时回到 PENDING，等待指数退避后的下次执行")
-    void retryableFailureShouldReturnToPending() throws Exception {
+    @DisplayName("可重试异常：指数退避后由补偿扫描器自动重试，最终成功")
+    void retryableFailureShouldEventuallySucceed() throws Exception {
         String taskId = taskSubmitService.submitTask(
                 uniqueKey(),
                 "{\"uid\":\"biz-retry-" + UUID.randomUUID() + "\",\"expIds\":[\"test2\"]}",
                 5, 3);
 
-        TaskEntity task = awaitTask(taskId, t -> t.getStatus() == TaskStatus.PENDING && t.getRetryCount() == 1);
-        assertNotNull(task.getFailReason());
-        assertTrue(task.getFailReason().contains("临时性"), "应记录业务异常原因");
-        assertTrue(task.getNextExecuteTime().isAfter(LocalDateTime.now()), "nextExecuteTime 应在未来（指数退避）");
+        // 第一次失败后回到 PENDING，并排定未来执行时间（指数退避）
+        TaskEntity pending = awaitTask(taskId,
+                t -> t.getStatus() == TaskStatus.PENDING && t.getRetryCount() == 1);
+        assertNotNull(pending.getFailReason());
+        assertTrue(pending.getFailReason().contains("临时性"), "应记录业务异常原因");
+        assertTrue(pending.getNextExecuteTime().isAfter(LocalDateTime.now()), "nextExecuteTime 应在未来（指数退避）");
 
-        // 重试任务不回内存队列，也不应在原进程内被立即重新执行
-        Thread.sleep(700);
-        TaskEntity afterWait = taskRepository.findById(taskId).orElseThrow();
-        assertEquals(1, afterWait.getRetryCount(), "重试任务不应被自动重新执行");
+        // 补偿扫描器到期后重新投递，第二次重试成功（模拟故障在 retryCount >= 2 后不再触发）
+        TaskEntity done = awaitTask(taskId, t -> t.getStatus() == TaskStatus.SUCCESS);
+        assertEquals(2, done.getRetryCount(), "应在两次重试后成功");
+        assertNotNull(taskResultRepository.findByTaskId(taskId).orElse(null), "成功任务应有关联结果");
     }
 
     @Test

@@ -272,6 +272,54 @@
 
 ---
 
+## 第 15 轮：功能清单全场景验证
+
+### Prompt
+
+> 验证全部功能清单（跑通全部场景）
+> 1. 提交任务返回 taskId；相同 businessKey 幂等返回同一个 taskId；
+> 2. 内存队列打满，触发背压抛出异常；
+> 3. 任务正常流转 PENDING → PROCESSING → SUCCESS，可以查询结果；
+> 4. 模拟业务失败，自动重试，超过最大重试进入死信；
+> 5. JVM 优雅停机：内存排队任务回写数据库；重启，任务重新加载继续执行；
+> 6. JVM 直接 kill -9 模拟崩溃：内存队列未处理任务内存丢失但 DB 存在；重启后重新加载执行；该边界要写进文档；
+> 7. 访问 actuator 查看监控指标；状态统计接口返回正确数字。
+
+### AI 返回（关键片段）
+
+补齐两处验证必需能力：
+
+1. 新增 `scheduler/TaskRecoveryScheduler`：每秒扫描到期的 `PENDING` 任务（重试任务 + 背压 deferred 任务）重新投递；
+   队列增加 `contains(taskId)` 去重，避免重复占位。
+2. 新增启动恢复：`TaskStateService.recoverProcessingTasks()`，把上次异常退出遗留的 `PROCESSING` 重置为 `PENDING`（单实例前提）。
+
+**发现并修复一个真实停机缺陷**：首次 SIGTERM 验证时出现
+`Database is already closed (to disable automatic closing at VM shutdown, add ";DB_CLOSE_ON_EXIT=FALSE")`。
+原因是 H2 自身的 shutdown hook 与 Spring 优雅停机并发执行，提前关闭数据库，导致队列回写与在途任务状态回写失败。
+修复：JDBC URL 增加 `DB_CLOSE_ON_EXIT=FALSE`；同时让回写失败不再中断后续停机步骤。
+
+验证结果（真实进程 + HTTP + H2 文件）：
+
+| 场景 | 结果 |
+| --- | --- |
+| 1 幂等 | 两次提交返回同一 taskId（`6fcb7cbf...`） |
+| 2 背压 | 第三个提交返回 429，响应说明任务已持久化 |
+| 3 正常流转 | `SUCCESS`，返回 2 条分桶结果，分组与桶号一致 |
+| 4 自动重试 | 首次失败 → PENDING/retryCount=1 → 扫描器重新投递 → 最终 SUCCESS，retryCount=2 |
+| 4 重试耗尽 | maxRetry=1 → `DEAD_LETTER`，原因「重试次数已耗尽(已重试1次)」 |
+| 4 不可恢复 | fatal uid → 直接 `DEAD_LETTER`，retryCount=0 |
+| 5 优雅停机 | `drained=1, updated=1`；在途任务完成；DB `SUCCESS=1, PENDING=2` |
+| 5 重启恢复 | 重启日志 `loaded=2`，最终 `SUCCESS=3` |
+| 6 kill -9 | 崩溃后 DB `PROCESSING=1, PENDING=2`；重启日志「启动恢复: 1 个 PROCESSING 任务重置为 PENDING」「loaded=3」，最终 `SUCCESS=3` |
+| 7 统计/指标 | `/task/stat` 数字正确；`/actuator/prometheus` 指标齐全，`async_task_retry_total=5.0` |
+
+边界结论（写进 README / DESIGN）：
+
+> kill -9 时内存队列会丢，但数据库不会丢：排队任务在库中一直是 `PENDING`，在途任务是 `PROCESSING`。
+> 单实例重启时先把 `PROCESSING` 重置为 `PENDING`，再统一加载执行；代价是「未完成任务可能被重复执行一次」，因此要求任务幂等。
+
+---
+
 ## 附：最终代码结构
 
 ```
@@ -287,6 +335,7 @@ src/main/java/com/example/asyncqueue/
 ├── metrics/           AsyncQueueMetrics
 ├── queue/             BoundedPriorityTaskQueue, TaskQueueFullException
 ├── repository/        TaskRepository, TaskResultRepository
+├── scheduler/         TaskRecoveryScheduler
 ├── service/           TaskSubmitService, TaskStateService, AbTestBucketService
 └── util/              MurmurHash3, BusinessKeyUtils
 

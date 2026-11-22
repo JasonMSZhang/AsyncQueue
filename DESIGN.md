@@ -220,7 +220,9 @@
 
 1. 先写库后入队（第 2.1 节）；
 2. 任务副作用幂等（AB 分桶是纯计算，天然幂等；若未来接入有副作用的 handler，必须由 handler 自己做幂等）；
-3. 有租约/超时机制回收僵尸 `RUNNING`，且有崩溃次数上限避免无限重跑。
+3. 有机制回收僵尸 `RUNNING`：当前实现利用**单实例**前提，在启动时把所有 `PROCESSING` 重置为 `PENDING` 后重新加载；运行期不退出、只线程假死的场景仍需租约/心跳（见 README 已知限制）。
+
+> 实现补充：H2 文件库 URL 必须带 `DB_CLOSE_ON_EXIT=FALSE`。否则 JVM 收到 SIGTERM 时，H2 自身的 shutdown hook 会与 Spring 优雅停机并发执行并提前关闭数据库，导致队列回写与在途任务状态回写失败（实测出现过 `Database is already closed`）。
 
 ---
 

@@ -45,6 +45,7 @@
     │   │   ├── metrics/          # Micrometer Gauge
     │   │   ├── queue/            # 自研有界优先级队列
     │   │   ├── repository/       # JPA Repository
+    │   │   ├── scheduler/        # 重试 / 补偿扫描器
     │   │   ├── service/          # 提交、状态流转、AB 分桶
     │   │   └── util/             # MurmurHash3、businessKey
     │   └── resources
@@ -215,9 +216,13 @@ curl -X POST http://localhost:8080/task/submit \
 | `async-queue.executor.shutdown-timeout-seconds` | 20 | 停机等待在途任务的超时 |
 | `async-queue.retry.base-delay-seconds` | 1 | 指数退避基础间隔 |
 | `async-queue.retry.max-delay-seconds` | 60 | 退避上限 |
+| `async-queue.scheduler.recovery-interval-millis` | 1000 | 重试/补偿扫描周期 |
+| `async-queue.scheduler.recovery-batch-size` | 200 | 单轮最多投递任务数 |
 | `async-queue.cache.ttl-seconds` | 180 | AB 分桶缓存 TTL |
 | `async-queue.cache.max-size` | 200000 | AB 分桶缓存最大条目 |
-| `spring.datasource.url` | `jdbc:h2:file:./data/abtask;DB_CLOSE_DELAY=-1` | H2 文件库 |
+| `spring.datasource.url` | `jdbc:h2:file:./data/abtask;DB_CLOSE_DELAY=-1;DB_CLOSE_ON_EXIT=FALSE` | H2 文件库 |
+
+> `DB_CLOSE_ON_EXIT=FALSE` 必须保留。否则 JVM 收到 SIGTERM 时，H2 自身的 shutdown hook 会与 Spring 优雅停机并发执行，可能先关闭数据库，导致队列回写和在途任务状态回写失败。
 
 严格「接口返回即落盘」可在 JDBC URL 末尾追加 `;WRITE_DELAY=0`（会降低写入吞吐）。
 
@@ -342,7 +347,11 @@ server {
   2. `drainAll()` 把内存队列任务批量回写 `PENDING`；
   3. 关闭队列入口，唤醒空闲消费者；
   4. 等待在途任务完成（默认 20s），超时 `shutdownNow()` 并把被中断任务标记 `FAILED`。
-- `kill -9` 不会走上述流程，但任务已持久化：重启时会把到期的 `PENDING` 任务重新加载执行；执行中的任务依赖人工/后续补偿机制处理。
+- `kill -9` 不会走上述流程，任务也不会丢：
+  - 内存队列里尚未执行的任务，在数据库中一直是 `PENDING`；
+  - 正在执行的任务在数据库中是 `PROCESSING`；
+  - 单实例重启时，启动流程会先把所有 `PROCESSING` 重置为 `PENDING`，再连同其余 `PENDING` 任务一起重新加载执行（AB 分桶是纯计算，重跑幂等且安全）。
+- 因此**崩溃恢复的边界**是：内存队列会丢，但数据库不会丢；恢复的代价是「未完成任务可能被重复执行一次」。
 
 ### 6. 数据备份与磁盘
 
@@ -369,10 +378,10 @@ systemctl start async-queue
 
 ## 已知限制
 
-1. **重试任务需要重新加载**：重试只回写数据库，进程内没有周期性补偿扫描器，需重启（或后续补充扫描任务）才会再次执行。
-2. **无租约回收**：若数据库不可用导致失败回写本身失败，任务可能停留在 `PROCESSING`，需要租约/超时回收机制。
-3. **单实例**：受 H2 file 模式限制，无法多实例共享同一库。
-4. **幂等存在并发窗口**：当前是「先查后插」，同一 businessKey 的高并发提交仍可能产生两条任务；彻底解决需要给主表增加活跃键唯一索引。
+1. **单实例约束**：受 H2 file 模式限制，无法多实例共享同一库；启动时把 `PROCESSING` 重置为 `PENDING` 的策略也以「同一时刻只有一个实例」为前提，误开双实例会互相抢任务。
+2. **无运行时租约/心跳**：只在启动时回收 `PROCESSING`。如果进程没有退出、只是某个任务线程假死，该任务会长期停留在 `PROCESSING`，需要额外的租约机制。
+3. **幂等存在并发窗口**：当前是「先查后插」，同一 businessKey 的高并发提交仍可能产生两条任务；彻底解决需要给主表增加活跃键唯一索引。
+4. **重试依赖扫描周期**：重试任务由补偿扫描器按 `nextExecuteTime` 重新投递，最小延迟受扫描周期（默认 1s）影响。
 
 ## 相关文档
 
